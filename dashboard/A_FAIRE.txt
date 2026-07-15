@@ -1,0 +1,4 @@
+Exporter ici le dashboard ThingsBoard au format JSON :
+Dashboards -> votre dashboard -> Export dashboard
+Nom suggere : cuveguard_dashboard.json
+(puis supprimer ce fichier avant de zipper)
