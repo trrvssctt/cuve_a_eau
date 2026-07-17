@@ -7,5 +7,5 @@
   "agent_access_token": "TOKEN_DU_DEVICE_AGENT",
   "seuil_start": 30.0,
   "seuil_stop": 90.0,
-  "intervalle_s": 10
+  "intervalle_s": 3
 }

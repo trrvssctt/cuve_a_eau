@@ -1,46 +1,77 @@
 {
   "version": 1,
-  "author": "Groupe DIT - CuveGuard",
+  "author": "Adji Dia",
   "editor": "wokwi",
   "parts": [
-    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 300, "attrs": {} },
-    { "type": "wokwi-hc-sr04", "id": "ultrasonic1", "top": -180, "left": 100, "attrs": {} },
-    { "type": "wokwi-dht22", "id": "dht1", "top": -180, "left": 450, "attrs": {} },
-    { "type": "wokwi-relay-module", "id": "relay1", "top": 250, "left": 550, "attrs": {} },
-    { "type": "wokwi-led", "id": "ledPompe", "top": 380, "left": 700, "attrs": { "color": "blue" } },
-    { "type": "wokwi-resistor", "id": "rPompe", "top": 350, "left": 700, "attrs": { "value": "220" } },
-    { "type": "wokwi-led", "id": "ledAlerte", "top": 250, "left": 150, "attrs": { "color": "red" } },
-    { "type": "wokwi-resistor", "id": "rAlerte", "top": 220, "left": 150, "attrs": { "value": "220" } },
-    { "type": "wokwi-buzzer", "id": "bz1", "top": 350, "left": 80, "attrs": { "volume": "0.1" } }
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 4.7, "left": 4.6, "attrs": {} },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultrasonic1",
+      "top": -161.7,
+      "left": -282.5,
+      "attrs": { "distance": "11" }
+    },
+    { "type": "wokwi-dht22", "id": "dht1", "top": 57.9, "left": -283.8, "attrs": {} },
+    { "type": "wokwi-relay-module", "id": "relay1", "top": -160, "left": 260, "attrs": {} },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer1",
+      "top": 204,
+      "left": 357,
+      "attrs": { "volume": "0.5" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_pump",
+      "top": 111.6,
+      "left": 339.8,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_pump",
+      "top": 147.95,
+      "left": 393.6,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led_alert",
+      "top": -3.6,
+      "left": 349.4,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r_alert",
+      "top": 80.75,
+      "left": 384,
+      "attrs": { "value": "220" }
+    }
   ],
   "connections": [
     [ "esp:TX0", "$serialMonitor:RX", "", [] ],
     [ "esp:RX0", "$serialMonitor:TX", "", [] ],
-
-    [ "ultrasonic1:VCC", "esp:VIN", "red", [] ],
-    [ "ultrasonic1:GND", "esp:GND.1", "black", [] ],
-    [ "ultrasonic1:TRIG", "esp:D5", "orange", [] ],
-    [ "ultrasonic1:ECHO", "esp:D17", "yellow", [] ],
-
-    [ "dht1:VCC", "esp:3V3", "red", [] ],
-    [ "dht1:GND", "esp:GND.1", "black", [] ],
-    [ "dht1:SDA", "esp:D18", "green", [] ],
-
-    [ "relay1:VCC", "esp:VIN", "red", [] ],
-    [ "relay1:GND", "esp:GND.2", "black", [] ],
-    [ "relay1:IN", "esp:D26", "limegreen", [] ],
-
-    [ "relay1:COM", "esp:VIN", "red", [] ],
-    [ "relay1:NO", "rPompe:1", "green", [] ],
-    [ "rPompe:2", "ledPompe:A", "green", [] ],
-    [ "ledPompe:C", "esp:GND.2", "black", [] ],
-
-    [ "esp:D25", "rAlerte:1", "red", [] ],
-    [ "rAlerte:2", "ledAlerte:A", "red", [] ],
-    [ "ledAlerte:C", "esp:GND.1", "black", [] ],
-
-    [ "bz1:2", "esp:D27", "purple", [] ],
-    [ "bz1:1", "esp:GND.1", "black", [] ]
+    [ "esp:VIN", "ultrasonic1:VCC", "red", [] ],
+    [ "esp:GND.1", "ultrasonic1:GND", "black", [] ],
+    [ "esp:VIN", "ultrasonic1:VCC", "red", [] ],
+    [ "esp:GND.1", "ultrasonic1:GND", "black", [] ],
+    [ "esp:D5", "ultrasonic1:TRIG", "green", [] ],
+    [ "esp:D18", "ultrasonic1:ECHO", "blue", [] ],
+    [ "esp:3V3", "dht1:VCC", "red", [] ],
+    [ "esp:GND.1", "dht1:GND", "black", [] ],
+    [ "esp:D4", "dht1:SDA", "green", [] ],
+    [ "esp:D26", "relay1:IN", "yellow", [] ],
+    [ "esp:VIN", "relay1:VCC", "red", [] ],
+    [ "esp:GND.2", "relay1:GND", "black", [] ],
+    [ "led_alert:C", "esp:GND.1", "black", [ "v76.8", "h-239.6" ] ],
+    [ "led_pump:C", "esp:GND.1", "black", [ "v0", "h-249.2" ] ],
+    [ "led_alert:A", "r_alert:1", "green", [ "v9.6", "h28.8" ] ],
+    [ "led_pump:A", "r_pump:1", "green", [ "v0" ] ],
+    [ "r_alert:2", "esp:D25", "green", [ "v-19.2", "h-433.2" ] ],
+    [ "r_pump:2", "esp:D27", "green", [ "v-76.8", "h-442.8" ] ],
+    [ "buzzer1:2", "esp:GND.2", "black", [ "v57.6", "h-480.4", "v-230.4" ] ],
+    [ "buzzer1:1", "esp:D33", "green", [ "v0", "h-432", "v-220.8", "h0", "v-19.2" ] ]
   ],
   "dependencies": {}
 }

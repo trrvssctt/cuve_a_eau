@@ -1,288 +1,269 @@
-// =====================================================================
-// CuveGuard — Surveillance d'un reservoir d'eau (Projet IoT M1 IA)
-// ESP32 + HC-SR04 (niveau) + DHT22 (temp/hum) + relais (pompe)
-// + LED rouge / buzzer (alerte locale niveau < 15 %)
-// Telemetrie MQTT -> ThingsBoard | RPC: setPump, setManualMode
-// =====================================================================
+/*
+  CuveGuard - Firmware ESP32 (projet Wokwi)
+  Master 1 IA - DIT - Projet IoT "CuveGuard"
 
-#define MQTT_MAX_PACKET_SIZE 512
+  Pilotage de la pompe :
+   -> La pompe est commandée UNIQUEMENT par RPC (setPump), quelle que soit
+      l'origine :
+        - agent Python (mode auto, seuils 30 % / 90 % avec hystérésis) ;
+        - dashboard ThingsBoard (mode manuel).
+   -> Le firmware ne fait plus d'auto-contrôle local : la logique auto est
+      entièrement portée par l'agent Python (conforme au sujet). Ainsi
+      l'état réel `pumpOn` reflète toujours la dernière commande reçue.
+   -> `manualMode` reste publié dans la télémétrie pour que l'agent sache
+      qu'il doit rester en HOLD (ne pas forcer la pompe).
+   -> L'alerte locale (LED rouge + buzzer) reste gérée sur l'ESP32.
+*/
 
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <DHTesp.h>
 #include <ArduinoJson.h>
+#include "DHT.h" // Bibliothèque officielle Adafruit
 
-#if __has_include("secrets.h")
-#include "secrets.h"
-#else
-#define TB_HOST "eu.thingsboard.cloud"
-#define TB_PORT 1883
-#define TB_ACCESS_TOKEN "METTRE_LE_TOKEN_DU_DEVICE_ESP32"
-#endif
+// ------------------------------------------------------------------
+// Configuration réseau et ThingsBoard
+// ------------------------------------------------------------------
+const char* WIFI_SSID     = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
+const char* TB_SERVER     = "eu.thingsboard.cloud";
+const int   TB_PORT       = 1883;
+const char* TB_TOKEN      = "ButC7lUC5TSw7FA4DWIV";
 
-// ---------------- Wi-Fi ----------------
-const char* WIFI_SSID = "Wokwi-GUEST";
-const char* WIFI_PASS = "";
+// CORRECTION : Adapté aux dimensions de la simulation Wokwi (~377 cm)
+const float DIST_CUVE_VIDE_CM   = 400.0; 
+const float DIST_CUVE_PLEINE_CM = 20.0;
 
-// ---------------- Brochage ----------------
-const int DHT_PIN     = 18;   // DHT22 data
-const int TRIG_PIN    = 5;    // HC-SR04 trigger
-const int ECHO_PIN    = 17;   // HC-SR04 echo
-const int PUMP_PIN    = 26;   // relais IN (pompe)
-const int LED_ALERTE  = 25;   // LED rouge (niveau bas)
-const int BUZZER_PIN  = 27;   // buzzer (niveau critique)
+// ------------------------------------------------------------------
+// Affectation des Broches
+// ------------------------------------------------------------------
+#define PIN_TRIG      5
+#define PIN_ECHO      18
+#define PIN_DHT       4
+#define PIN_RELAY     26
+#define PIN_LED_PUMP  27
+#define PIN_LED_ALERT 25
+#define PIN_BUZZER    33
 
-// ---------------- Geometrie de la cuve ----------------
-// Le capteur est fixe au sommet, il mesure la distance jusqu'a la surface.
-// Distance grande = cuve vide ; distance petite = cuve pleine.
-const float DIST_CUVE_VIDE_CM  = 380.0;  // fond de la cuve (0 %)
-const float DIST_CUVE_PLEINE_CM = 20.0;  // surface au maximum (100 %)
+#define DHTTYPE DHT22
 
-// ---------------- Seuils d'alerte ----------------
-const float SEUIL_ATTENTION = 30.0;  // alertLevel = 1 en dessous
-const float SEUIL_CRITIQUE  = 15.0;  // alertLevel = 2 en dessous (alerte locale)
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+DHT dht(PIN_DHT, DHTTYPE);
 
-const unsigned long TELEMETRY_INTERVAL_MS = 5000;
-
-// ---------------- Objets ----------------
-DHTesp dhtSensor;
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
-
-// ---------------- Etat ----------------
 bool pumpOn = false;
 bool manualMode = false;
-int  alertLevel = 0;              // 0 normal / 1 attention / 2 critique
+
 unsigned long lastTelemetry = 0;
-unsigned long lastBeep = 0;
+// 3 s : cadence sûre pour le tier gratuit d'eu.thingsboard.cloud. Publier
+// plus vite (1 s) fait dépasser la limite de débit -> la session du device
+// est bridée et les RPC entrants (setPump/setManualMode) sont perdus.
+const unsigned long TELEMETRY_INTERVAL_MS = 3000;
+unsigned long lastMqttAttempt = 0;
 
-// =====================================================================
-// CONNEXIONS
-// =====================================================================
-void connectWiFi() {
-  Serial.print("Wi-Fi");
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+// Dernières valeurs DHT valides (le DHT22 ne s'échantillonne qu'à ~2 s ;
+// on conserve la dernière lecture correcte au lieu de retomber à 0).
+float lastTemp = 24.0;
+float lastHum  = 40.0;
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(250);
+// ------------------------------------------------------------------
+// Connexion Wi-Fi
+// ------------------------------------------------------------------
+void connectWifi() {
+  Serial.print("Connexion Wi-Fi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
     Serial.print(".");
-    attempts++;
   }
-  Serial.println(WiFi.status() == WL_CONNECTED ? " OK" : " ECHEC");
+  Serial.println(" OK");
+  Serial.print("Adresse IP : ");
+  Serial.println(WiFi.localIP());
 }
 
-bool connectMQTT() {
-  if (!WiFi.isConnected()) return false;
-
-  mqttClient.setServer(TB_HOST, TB_PORT);
-  mqttClient.setBufferSize(512);
-
-  Serial.print("MQTT");
-  if (mqttClient.connect("esp32-cuveguard", TB_ACCESS_TOKEN, nullptr)) {
-    mqttClient.subscribe("v1/devices/me/rpc/request/+");
-    Serial.println(" OK");
-    return true;
-  }
-  Serial.printf(" rc=%d\n", mqttClient.state());
-  return false;
-}
-
-// =====================================================================
-// CAPTEURS
-// =====================================================================
-float readDistanceCm() {
-  digitalWrite(TRIG_PIN, LOW);
+// ------------------------------------------------------------------
+// Capteur Ultrasons
+// ------------------------------------------------------------------
+float mesurerDistanceCm() {
+  digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(PIN_TRIG, LOW);
 
-  // timeout 30 ms (~5 m aller-retour)
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duration == 0) return -1;               // pas d'echo
-  return duration * 0.0343 / 2.0;             // vitesse du son
+  long duree = pulseIn(PIN_ECHO, HIGH, 30000UL);
+  if (duree == 0) return DIST_CUVE_VIDE_CM;
+  return duree * 0.034f / 2.0f;
 }
 
-float distanceToLevelPct(float distanceCm) {
-  // Interpolation lineaire entre cuve vide et cuve pleine
-  float pct = (DIST_CUVE_VIDE_CM - distanceCm) * 100.0
-              / (DIST_CUVE_VIDE_CM - DIST_CUVE_PLEINE_CM);
-  if (pct < 0)   pct = 0;
+float distanceVersPourcentage(float distanceCm) {
+  float pct = 100.0f * (DIST_CUVE_VIDE_CM - distanceCm) / (DIST_CUVE_VIDE_CM - DIST_CUVE_PLEINE_CM);
+  if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   return pct;
 }
 
-int computeAlertLevel(float levelPct) {
-  if (levelPct < SEUIL_CRITIQUE)  return 2;   // critique
-  if (levelPct < SEUIL_ATTENTION) return 1;   // attention
-  return 0;                                   // normal
+int calculerAlertLevel(float pct) {
+  if (pct < 15.0f) return 2;   // Critique
+  if (pct < 30.0f) return 1;   // Attention
+  return 0;                    // Normal
 }
 
-// =====================================================================
-// ALERTE LOCALE (LED rouge + buzzer)
-// =====================================================================
-void gererAlerteLocale() {
-  if (alertLevel == 2) {
-    digitalWrite(LED_ALERTE, HIGH);
-    // bip intermittent toutes les 2 s, sans bloquer le loop
-    if (millis() - lastBeep > 2000) {
-      lastBeep = millis();
-      tone(BUZZER_PIN, 800, 300);
-    }
-  } else if (alertLevel == 1) {
-    digitalWrite(LED_ALERTE, HIGH);   // LED fixe, pas de buzzer
-    noTone(BUZZER_PIN);
-  } else {
-    digitalWrite(LED_ALERTE, LOW);
-    noTone(BUZZER_PIN);
-  }
-}
-
-// =====================================================================
-// POMPE
-// =====================================================================
-void setPump(bool on) {
+// ------------------------------------------------------------------
+// Contrôle des Actionneurs
+// ------------------------------------------------------------------
+void appliquerEtatPompe(bool on) {
   pumpOn = on;
-  digitalWrite(PUMP_PIN, on ? HIGH : LOW);
-  Serial.printf("[POMPE] %s\n", on ? "ON" : "OFF");
+  digitalWrite(PIN_RELAY, pumpOn ? LOW : HIGH);
+  digitalWrite(PIN_LED_PUMP, pumpOn ? HIGH : LOW);
 }
 
-// =====================================================================
-// RPC (commandes recues de ThingsBoard / agent Python)
-// =====================================================================
-void sendRpcResponse(const char* requestId, JsonDocument& response) {
-  char buffer[128];
-  size_t len = serializeJson(response, buffer);
-  char topic[64];
-  snprintf(topic, sizeof(topic), "v1/devices/me/rpc/response/%s", requestId);
-  mqttClient.publish(topic, buffer, len);
+void appliquerAlerteLocale(int alertLevel) {
+  bool critique = (alertLevel == 2);
+  digitalWrite(PIN_LED_ALERT, critique ? HIGH : LOW);
+  digitalWrite(PIN_BUZZER, critique ? HIGH : LOW);
 }
 
-// Les params peuvent arriver sous forme {"value": true} ou true directement
-bool extractBoolParam(JsonVariant params) {
+// ------------------------------------------------------------------
+// Gestion des Requêtes RPC (ThingsBoard)
+// ------------------------------------------------------------------
+bool extraireValeurBool(JsonVariant params) {
   if (params.is<bool>()) return params.as<bool>();
-  return params["value"] | false;
+  if (params.is<JsonObject>()) return params["value"] | false;
+  return false;
 }
 
-void processRpc(const char* requestId, JsonDocument& doc) {
-  const char* method = doc["method"] | "";
-  JsonVariant params = doc["params"];
-  StaticJsonDocument<128> response;
+void callback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
-  if (strcmp(method, "setPump") == 0) {
-    setPump(extractBoolParam(params));
-    response["pumpOn"] = pumpOn;
-    Serial.println("[RPC] setPump recu");
+  Serial.println("RPC reçu [" + topicStr + "] : " + msg);
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, msg);
+  if (err) return;
+
+  String method = doc["method"] | "";
+
+  int idx = topicStr.lastIndexOf('/');
+  String requestId = (idx > 0) ? topicStr.substring(idx + 1) : "";
+  String responseTopic = "v1/devices/me/rpc/response/" + requestId;
+
+  JsonDocument resp;
+
+  if (method == "setPump") {
+    appliquerEtatPompe(extraireValeurBool(doc["params"]));
+    resp["pumpOn"]     = pumpOn;
+    resp["success"]    = true;
   }
-  else if (strcmp(method, "setManualMode") == 0) {
-    manualMode = extractBoolParam(params);
-    response["manualMode"] = manualMode;
-    Serial.printf("[RPC] setManualMode = %s\n", manualMode ? "true" : "false");
+  else if (method == "setManualMode") {
+    manualMode = extraireValeurBool(doc["params"]);
+    resp["manualMode"] = manualMode;
+    resp["success"]    = true;
   }
-  else if (strcmp(method, "getState") == 0) {
-    response["pumpOn"] = pumpOn;
-    response["manualMode"] = manualMode;
+  else if (method == "getState") {
+    resp["pumpOn"]     = pumpOn;
+    resp["manualMode"] = manualMode;
   }
   else {
-    response["error"] = "methode inconnue";
+    resp["success"]    = false;
   }
-  sendRpcResponse(requestId, response);
+
+  if (requestId.length() > 0) {
+    char buffer[128];
+    size_t n = serializeJson(resp, buffer);
+    mqtt.publish(responseTopic.c_str(), buffer, n);
+  }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  const char* prefix = "v1/devices/me/rpc/request/";
-  size_t prefixLen = strlen(prefix);
-  if (strncmp(topic, prefix, prefixLen) != 0) return;
-
-  const char* requestId = topic + prefixLen;
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, payload, length)) return;
-  processRpc(requestId, doc);
+// ------------------------------------------------------------------
+// Gestion de la Connexion MQTT
+// ------------------------------------------------------------------
+void connectMqtt() {
+  Serial.print("Tentative de connexion MQTT...");
+  if (mqtt.connect("ESP32CuveGuard", TB_TOKEN, NULL)) {
+    Serial.println(" OK !");
+    mqtt.subscribe("v1/devices/me/rpc/request/+");
+  } else {
+    Serial.print(" Échec, code d'erreur : ");
+    Serial.println(mqtt.state());
+  }
 }
 
-// =====================================================================
-// TELEMETRIE (cles imposees par le sujet)
-// =====================================================================
-void publishTelemetry(float distanceCm, float levelPct,
-                      float temperature, float humidity) {
-  StaticJsonDocument<320> doc;
+void publierTelemetrie(float distanceCm, float waterLevelPct, float temperature, float humidity, int alertLevel) {
+  JsonDocument doc;
   doc["distanceCm"]    = distanceCm;
-  doc["waterLevelPct"] = levelPct;
+  doc["waterLevelPct"] = waterLevelPct;
   doc["temperature"]   = temperature;
   doc["humidity"]      = humidity;
   doc["pumpOn"]        = pumpOn;
   doc["manualMode"]    = manualMode;
   doc["alertLevel"]    = alertLevel;
 
-  char buffer[320];
-  size_t len = serializeJson(doc, buffer);
-  mqttClient.publish("v1/devices/me/telemetry", buffer, len);
-
-  Serial.printf("[TELEMETRIE] dist=%.1fcm niveau=%.0f%% T=%.1fC H=%.0f%% pompe=%s mode=%s alerte=%d\n",
-                distanceCm, levelPct, temperature, humidity,
-                pumpOn ? "ON" : "OFF",
-                manualMode ? "MANUEL" : "AUTO",
-                alertLevel);
+  char buffer[256];
+  size_t n = serializeJson(doc, buffer);
+  mqtt.publish("v1/devices/me/telemetry", buffer, n);
+  Serial.print("Télémesure transmise : ");
+  Serial.println(buffer);
 }
 
-// =====================================================================
+// ------------------------------------------------------------------
+// Initialisation et Boucle Principale
+// ------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(100);
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(PUMP_PIN, OUTPUT);
-  pinMode(LED_ALERTE, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  pinMode(PIN_RELAY, OUTPUT);
+  pinMode(PIN_LED_PUMP, OUTPUT);
+  pinMode(PIN_LED_ALERT, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
 
-  setPump(false);
-  digitalWrite(LED_ALERTE, LOW);
+  appliquerEtatPompe(false);
+  digitalWrite(PIN_LED_ALERT, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
 
-  dhtSensor.setup(DHT_PIN, DHTesp::DHT22);
+  dht.begin();
 
-  connectWiFi();
-  mqttClient.setCallback(mqttCallback);
-  connectMQTT();
+  connectWifi();
+  mqtt.setServer(TB_SERVER, TB_PORT);
+  mqtt.setCallback(callback);
+  mqtt.setBufferSize(512);
+
+  connectMqtt();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-
-  if (!mqttClient.connected()) {
-    mqttClient.setCallback(mqttCallback);
-    connectMQTT();
-    delay(2000);
-    return;
+  if (!mqtt.connected()) {
+    if (millis() - lastMqttAttempt > 5000) {
+      lastMqttAttempt = millis();
+      connectMqtt();
+    }
+  } else {
+    mqtt.loop();
   }
 
-  mqttClient.loop();
+  if (millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetry = millis();
 
-  // L'alerte locale est geree en continu (pas seulement a la telemetrie)
-  gererAlerteLocale();
+    float distanceCm    = mesurerDistanceCm();
+    float waterLevelPct = distanceVersPourcentage(distanceCm);
 
-  unsigned long now = millis();
-  if (now - lastTelemetry < TELEMETRY_INTERVAL_MS) return;
-  lastTelemetry = now;
+    float temperature = dht.readTemperature();
+    float humidity    = dht.readHumidity();
+    // Garde la dernière valeur valide si la lecture échoue (NaN)
+    if (isnan(temperature)) temperature = lastTemp; else lastTemp = temperature;
+    if (isnan(humidity))    humidity    = lastHum;  else lastHum  = humidity;
 
-  // --- Lecture capteurs ---
-  float distance = readDistanceCm();
-  if (distance < 0) {
-    Serial.println("HC-SR04: pas d'echo");
-    return;
+    int alertLevel = calculerAlertLevel(waterLevelPct);
+    appliquerAlerteLocale(alertLevel);
+
+    // La pompe n'est pilotée que par RPC (agent Python en auto, dashboard en
+    // manuel). Aucun auto-contrôle local : voir en-tête du fichier.
+
+    if (mqtt.connected()) {
+      publierTelemetrie(distanceCm, waterLevelPct, temperature, humidity, alertLevel);
+    }
   }
-
-  TempAndHumidity dht = dhtSensor.getTempAndHumidity();
-  if (isnan(dht.temperature) || isnan(dht.humidity)) {
-    Serial.println("DHT22: erreur lecture");
-    return;
-  }
-
-  float levelPct = distanceToLevelPct(distance);
-  alertLevel = computeAlertLevel(levelPct);
-
-  publishTelemetry(distance, levelPct, dht.temperature, dht.humidity);
 }

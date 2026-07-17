@@ -58,6 +58,17 @@ def main() -> None:
           f"{control.seuil_start:.0f}%/{control.seuil_stop:.0f}%, "
           f"cycle {intervalle}s. Ctrl+C pour arreter.")
 
+    # Gestion fiable de la commande pompe :
+    #   - `last_pump_command` = etat commande, en attente de confirmation par
+    #     la telemetrie (None = pas de commande en attente).
+    #   - on renvoie la RPC si l'etat n'est toujours pas confirme apres
+    #     `RENVOI_RPC_S` (RPC one-way non garantie : une commande peut se
+    #     perdre pendant une micro-deconnexion MQTT), sans pour autant
+    #     spammer a chaque cycle.
+    last_pump_command = None
+    last_command_time = 0.0
+    RENVOI_RPC_S = 6.0
+
     try:
         while True:
             try:
@@ -76,17 +87,34 @@ def main() -> None:
                 command_sent = False
 
                 if manual:
-                    # Mode manuel : l'agent observe mais ne commande jamais
+                    # Mode manuel : l'agent observe mais ne commande jamais.
+                    # On oublie la derniere commande auto : au retour en auto,
+                    # la decision repartira de l'etat reel du device.
                     decision, auto_mode = "HOLD", False
+                    last_pump_command = None
                     print(f"[ORCHESTRATOR] niveau={level:.0f}% | "
                           f"MODE MANUEL -> HOLD")
                 else:
                     auto_mode = True
+                    # On reconcilie notre memoire avec l'etat reel : si la
+                    # telemetrie confirme l'etat de la pompe, la commande est
+                    # bien passee, on peut re-commander librement plus tard.
+                    if last_pump_command is not None and pump_on == last_pump_command:
+                        last_pump_command = None
+
                     d = control.decider(level, pump_on)
                     decision = d.decision
                     if d.commande is not None:
-                        rest.envoyer_rpc("setPump", d.commande)
-                        command_sent = True
+                        nouvelle = d.commande != last_pump_command
+                        non_confirmee = (
+                            time.monotonic() - last_command_time > RENVOI_RPC_S)
+                        # Envoi si c'est une nouvelle commande, ou reemission
+                        # si la precedente n'a toujours pas ete confirmee.
+                        if nouvelle or non_confirmee:
+                            rest.envoyer_rpc("setPump", d.commande)
+                            last_pump_command = d.commande
+                            last_command_time = time.monotonic()
+                            command_sent = True
                     print(f"[ORCHESTRATOR] niveau={level:.0f}% "
                           f"pompe={'ON' if pump_on else 'OFF'} -> {decision}")
 
